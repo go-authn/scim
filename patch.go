@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -104,7 +105,14 @@ func applyPatch(res map[string]any, ops []PatchOp, readOnly map[string]bool) *Er
 			if !ok {
 				return badRequest("invalidValue", "operation %d: without a path, the value must be an object", i)
 			}
-			for k, v := range obj {
+			// In key order: "name" and "name.givenName" in one object must
+			// not give a result that depends on map iteration.
+			keys := make([]string, 0, len(obj))
+			for k := range obj {
+				keys = append(keys, k)
+			}
+			slices.Sort(keys)
+			for _, k := range keys {
 				if strings.EqualFold(k, "schemas") {
 					continue
 				}
@@ -112,7 +120,7 @@ func applyPatch(res map[string]any, ops []PatchOp, readOnly map[string]bool) *Er
 				if err != nil {
 					return err
 				}
-				if err := applyOne(res, kind, pp, v, true, readOnly); err != nil {
+				if err := applyOne(res, kind, pp, obj[k], true, readOnly); err != nil {
 					return err
 				}
 			}
@@ -290,6 +298,11 @@ func applyFiltered(base map[string]any, k string, cur any, kind string, pp patch
 		}
 	}
 	if len(hits) == 0 {
+		if kind == "remove" {
+			// RFC 7644 §3.5.2.2: removing what is not there changes nothing
+			// and succeeds (Entra ID removes members it believes are present).
+			return nil
+		}
 		if kind == "add" && pp.sub != "" {
 			if elem, ok := equalities(pp.filter); ok {
 				elem[pp.sub] = v
