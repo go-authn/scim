@@ -152,10 +152,26 @@ func (n *valueFilter) match(m map[string]any) bool {
 	return false
 }
 
+// camelCase spells the attributes whose canonical name has capitals, by their
+// lower-case form: a filter names an attribute in whatever case, the
+// resources this package builds spell it one way, and trying that spelling
+// first answers a lookup without scanning every key.
+var camelCase = map[string]string{
+	"username": "userName", "externalid": "externalId", "displayname": "displayName",
+	"familyname": "familyName", "givenname": "givenName", "middlename": "middleName",
+	"honorificprefix": "honorificPrefix", "honorificsuffix": "honorificSuffix",
+	"resourcetype": "resourceType", "lastmodified": "lastModified",
+}
+
 // lookup finds a key without regard to case (RFC 7643 §2.1).
 func lookup(m map[string]any, key string) any {
 	if v, ok := m[key]; ok {
 		return v
+	}
+	if c, ok := camelCase[key]; ok {
+		if v, ok := m[c]; ok {
+			return v
+		}
 	}
 	for k, v := range m {
 		if strings.EqualFold(k, key) {

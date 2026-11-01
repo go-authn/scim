@@ -1,7 +1,6 @@
 package scim
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +33,13 @@ type Server struct {
 	MaxResults int
 	// MaxBodyBytes bounds a request body (default 1 MiB).
 	MaxBodyBytes int64
+	// ReadTimeout bounds the time a request body may take to arrive
+	// (default 30 s). A client sending a byte a minute is cut off with a 400
+	// instead of holding a goroutine and a connection. The deadline replaces
+	// the http.Server's own ReadTimeout for this request; a negative value
+	// leaves the http.Server's alone. It needs a ResponseWriter that supports
+	// read deadlines (net/http's does).
+	ReadTimeout time.Duration
 	// MaxOperations bounds the operations of one PATCH (default 100).
 	MaxOperations int
 	// MaxMembers bounds the members of one group (default 10000).
@@ -83,13 +91,20 @@ func (s *Server) newID() string {
 
 // BearerAuth admits requests carrying "Authorization: Bearer <token>",
 // compared in constant time, and answers others 401 with a SCIM error. An
-// empty token admits nobody. The token should be long and random (RFC 7644
-// §7.4); TLS is the caller's to provide (§7.1).
+// empty token admits nobody. The scheme name is case-insensitive (RFC 7235
+// §2.1); the token is compared in constant time. The token should be long and
+// random (RFC 7644 §7.4); TLS is the caller's to provide (§7.1).
 func BearerAuth(token string, next http.Handler) http.Handler {
-	want := sha256.Sum256([]byte("Bearer " + token))
+	want := sha256.Sum256([]byte(token))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := sha256.Sum256([]byte(r.Header.Get("Authorization")))
-		if token == "" || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+		h := r.Header.Get("Authorization")
+		scheme := len(h) > len("Bearer ") && strings.EqualFold(h[:len("Bearer ")], "Bearer ")
+		presented := ""
+		if scheme {
+			presented = h[len("Bearer "):]
+		}
+		got := sha256.Sum256([]byte(presented))
+		if token == "" || !scheme || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="scim"`)
 			writeError(w, &Error{Status: http.StatusUnauthorized, Detail: "a valid bearer token is required"})
 			return
@@ -204,6 +219,15 @@ func (rt resourceType) schema() string {
 func (rt resourceType) endpoint() string { return "/" + rt.name() + "s" }
 
 func (s *Server) body(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	d := s.ReadTimeout
+	if d == 0 {
+		d = 30 * time.Second
+	}
+	if d > 0 {
+		// The server resets the deadline for the next request on the
+		// connection; an error means the writer has no deadlines.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(d))
+	}
 	b, err := io.ReadAll(io.LimitReader(r.Body, s.maxBody()+1))
 	if err != nil {
 		writeError(w, badRequest("invalidSyntax", "unreadable body"))
@@ -453,27 +477,56 @@ func (s *Server) replace(w http.ResponseWriter, r *http.Request, rt resourceType
 		writeError(w, e)
 		return
 	}
-	cur, err := s.load(r.Context(), rt, id)
-	if err != nil {
-		s.fail(w, err)
+	for attempt := 0; ; attempt++ {
+		cur, err := s.load(r.Context(), rt, id)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		err = s.store(r, rt, id, cur, res)
+		if s.retry(r, err, attempt) {
+			continue
+		}
+		s.stored(w, r, rt, id, err)
 		return
 	}
-	s.store(w, r, rt, id, cur, res)
+}
+
+// maxRetries bounds how often a write that lost a race is redone.
+const maxRetries = 32
+
+// retry reports whether a write that failed with ErrPrecondition should be
+// redone on the newer version: only when the client asked for no precondition
+// (no If-Match, or "*"), since then the version check guards the server's own
+// read-modify-write and is not the client's to be told about. With one writer
+// winning per round, a bounded number of rounds serves a bounded crowd; the
+// rest are told 412.
+func (s *Server) retry(r *http.Request, err error, attempt int) bool {
+	if !errors.Is(err, ErrPrecondition) || attempt >= maxRetries {
+		return false
+	}
+	if h := r.Header.Get("If-Match"); h != "" && h != "*" {
+		return false
+	}
+	runtime.Gosched()
+	return true
 }
 
 // store replaces cur by res, conditionally on cur's version.
-func (s *Server) store(w http.ResponseWriter, r *http.Request, rt resourceType, id string, cur, res resource) {
+func (s *Server) store(r *http.Request, rt resourceType, id string, cur, res resource) error {
 	if !ifMatch(r, cur.meta().Version) {
-		s.fail(w, ErrPrecondition)
-		return
+		return ErrPrecondition
 	}
 	s.stamp(res, rt, id, cur.meta().Created)
-	var err error
 	if rt == resourceUser {
-		err = s.Backend.ReplaceUser(r.Context(), *res.(*User), cur.meta().Version)
-	} else {
-		err = s.Backend.ReplaceGroup(r.Context(), *res.(*Group), cur.meta().Version)
+		return s.Backend.ReplaceUser(r.Context(), *res.(*User), cur.meta().Version)
 	}
+	return s.Backend.ReplaceGroup(r.Context(), *res.(*Group), cur.meta().Version)
+}
+
+// stored answers a write: the error, or the resource as the Backend now
+// holds it.
+func (s *Server) stored(w http.ResponseWriter, r *http.Request, rt resourceType, id string, err error) {
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -508,54 +561,79 @@ func (s *Server) patch(w http.ResponseWriter, r *http.Request, rt resourceType, 
 		writeError(w, &Error{Status: http.StatusRequestEntityTooLarge, Detail: fmt.Sprintf("maxOperations is %d", s.maxOperations())})
 		return
 	}
-	cur, err := s.load(r.Context(), rt, id)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	m, err := toMap(cur)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
 	readOnly := map[string]bool{"id": true, "meta": true, "schemas": true}
 	if rt == resourceUser {
 		readOnly["groups"] = true
 	}
-	if e := applyPatch(m, req.Operations, readOnly); e != nil {
-		writeError(w, e)
-		return
-	}
-	patched, err := json.Marshal(m)
-	if err != nil {
-		s.fail(w, err)
-		return
-	}
-	if int64(len(patched)) > s.maxBody() {
-		writeError(w, &Error{Status: http.StatusRequestEntityTooLarge, Detail: "the patched resource is too large"})
-		return
-	}
-	res, e := s.decode(patched, rt)
-	if e != nil {
-		writeError(w, e)
-		return
-	}
-	s.store(w, r, rt, id, cur, res)
-}
-
-func (s *Server) delete(w http.ResponseWriter, r *http.Request, rt resourceType, id string) {
-	if r.Header.Get("If-Match") != "" {
+	// Read, patch, write if unchanged; a write that lost a race to another
+	// writer is redone on what that writer left (see retry).
+	for attempt := 0; ; attempt++ {
 		cur, err := s.load(r.Context(), rt, id)
 		if err != nil {
 			s.fail(w, err)
+			return
+		}
+		m, err := toMap(cur)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		if e := applyPatch(m, req.Operations, readOnly); e != nil {
+			writeError(w, e)
+			return
+		}
+		patched, err := json.Marshal(m)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		if int64(len(patched)) > s.maxBody() {
+			writeError(w, &Error{Status: http.StatusRequestEntityTooLarge, Detail: "the patched resource is too large"})
+			return
+		}
+		res, e := s.decode(patched, rt)
+		if e != nil {
+			writeError(w, e)
+			return
+		}
+		err = s.store(r, rt, id, cur, res)
+		if s.retry(r, err, attempt) {
+			continue
+		}
+		s.stored(w, r, rt, id, err)
+		return
+	}
+}
+
+func (s *Server) delete(w http.ResponseWriter, r *http.Request, rt resourceType, id string) {
+	var err error
+	if r.Header.Get("If-Match") != "" {
+		cur, lerr := s.load(r.Context(), rt, id)
+		if lerr != nil {
+			s.fail(w, lerr)
 			return
 		}
 		if !ifMatch(r, cur.meta().Version) {
 			s.fail(w, ErrPrecondition)
 			return
 		}
+		// A Backend that can delete "if still at this version" closes the
+		// gap between the check above and the delete; others get the check
+		// alone.
+		if cd, ok := s.Backend.(ConditionalDeleter); ok {
+			if rt == resourceUser {
+				err = cd.DeleteUserIf(r.Context(), id, cur.meta().Version)
+			} else {
+				err = cd.DeleteGroupIf(r.Context(), id, cur.meta().Version)
+			}
+			if err != nil {
+				s.fail(w, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
-	var err error
 	if rt == resourceUser {
 		err = s.Backend.DeleteUser(r.Context(), id)
 	} else {
@@ -624,11 +702,13 @@ func pageParam(q map[string][]string, name string, def int) (int, *Error) {
 	if v == "" {
 		return def, nil
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil && !errors.Is(err, strconv.ErrRange) {
 		return 0, badRequest("invalidValue", "%s must be an integer", name)
 	}
-	return n, nil
+	// A value beyond what an int holds (on a 32-bit target, beyond 2^31) is
+	// clamped, not refused: the page is empty or the maximum, as on 64 bits.
+	return int(max(min(n, math.MaxInt32), math.MinInt32)), nil
 }
 
 func first(q map[string][]string, name string) string {
@@ -685,39 +765,43 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, rt resourceType, q
 	slices.SortFunc(all, func(a, b resource) int {
 		return strings.Compare(a.(interface{ ident() string }).ident(), b.(interface{ ident() string }).ident())
 	})
-	var matched []map[string]any
+	// Only a filter needs every resource as a JSON object; without one, the
+	// objects are built for the page alone.
+	type hit struct {
+		res resource
+		m   map[string]any // nil until needed
+	}
+	matched := make([]hit, 0, len(all))
 	for _, res := range all {
+		if f == nil {
+			matched = append(matched, hit{res: res})
+			continue
+		}
 		m, err := toMap(res)
 		if err != nil {
 			s.fail(w, err)
 			return
 		}
-		if f == nil || f.Match(m) {
-			matched = append(matched, m)
+		if f.Match(m) {
+			matched = append(matched, hit{res, m})
 		}
 	}
 	out := listResponse{Schemas: []string{ListResponse}, TotalResults: len(matched), StartIndex: start, Resources: []map[string]any{}}
 	if start <= len(matched) {
 		end := min(start-1+count, len(matched))
-		for _, m := range matched[start-1 : end] {
-			out.Resources = append(out.Resources, project(m, first(q, "attributes"), first(q, "excludedAttributes")))
+		for _, h := range matched[start-1 : end] {
+			if h.m == nil {
+				var err error
+				if h.m, err = toMap(h.res); err != nil {
+					s.fail(w, err)
+					return
+				}
+			}
+			out.Resources = append(out.Resources, project(h.m, first(q, "attributes"), first(q, "excludedAttributes")))
 		}
 	}
 	out.ItemsPerPage = len(out.Resources)
 	writeJSON(w, http.StatusOK, out)
-}
-
-func toMap(v any) (map[string]any, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var m map[string]any
-	d := json.NewDecoder(bytes.NewReader(b))
-	if err := d.Decode(&m); err != nil {
-		return nil, err
-	}
-	return m, nil
 }
 
 // project applies attributes / excludedAttributes (RFC 7644 §3.9). id and

@@ -36,7 +36,11 @@ mux.Handle("/scim/v2/", http.StripPrefix("/scim/v2", scim.BearerAuth(token, srv)
 - **PATCH**: `add`, `remove`, `replace` with and without a path, value-filter
   paths with a sub-attribute (`emails[type eq "work"].value`), atomic: an
   operation that fails leaves the resource as it was. Concurrent writers are
-  detected through the resource version, never overwritten.
+  detected through the resource version, never overwritten: with an `If-Match`
+  the loser gets 412; without one (no precondition asked) a write that lost the
+  race is redone on the newer version (up to 32 times), so concurrent PATCHes
+  all land. Removing what is not there succeeds (RFC 7644 §3.5.2.2). A PATCH
+  without a path applies its keys in sorted order.
 - **Paging**: 1-based `startIndex`, `count` clamped to `MaxResults` (RFC 7644
   §3.4.2.4: below 1 is 1, a negative count is 0), in a stable order.
 - **What identity providers really send**, tested with their payloads: Entra
@@ -66,6 +70,13 @@ filter — `Filter.Equality()` names the cheap case, `userName eq "…"` — or
 return everything: the Server applies the filter exactly to what comes back.
 `NewMemory()` is the reference implementation.
 
+A Backend may also implement `ConditionalDeleter` (`DeleteUserIf` and
+`DeleteGroupIf`, delete only at the given version). `DELETE` with `If-Match`
+then uses it, so a write landing between the version check and the delete is
+not deleted unseen; without it the check and the delete are two steps.
+`Filter.Equality()` hands a Backend the decoded string: pass it to the store as
+a parameter, never splice it into a query.
+
 ## What it refuses
 
 Everything here comes from outside, so the limits are part of the API:
@@ -77,13 +88,25 @@ Everything here comes from outside, so the limits are part of the API:
 | a filter over 4 KiB, nested deeper than 32, with an unknown operator, or `gt` on a boolean | 400 `invalidFilter` |
 | writes to `id`, `meta`, `schemas` or a user's `groups` | 400 `mutability` |
 | a resource without its core schema, a `userName` that is empty, over 256 bytes or has control characters, two primary emails | 400 |
-| a missing or wrong bearer token (`BearerAuth`, constant time; an empty token admits nobody) | 401 |
+| a missing or wrong bearer token (`BearerAuth`, constant time, scheme name without case; an empty token admits nobody) | 401 |
+| a body that takes longer than `ReadTimeout` (30 s) to arrive | 400 |
 | any Backend error that is not one of the sentinels | 500 with a body that says nothing; the error goes to `ErrorLog` |
 
 Duplicate members are skipped in linear time, so a PATCH adding ten thousand
 members costs ten thousand map lookups rather than a hundred million
 comparisons. The filter, PATCH and the whole handler are fuzzed
-(`FuzzFilter`, `FuzzPatch`, `FuzzServer`).
+(`FuzzFilter`, `FuzzPatch`, `FuzzPatchPath`, `FuzzPatchThenDecode`,
+`FuzzServer`). A `password` sent by a client is neither stored nor returned.
+`startIndex` and `count` beyond what an `int` holds are clamped (the same on
+32 and 64 bits).
+
+**Performance** (10,000 users, 200 groups, Memory backend, per request):
+a list page costs 15 000 allocations (was 789 000); `userName eq "…"` costs 90
+(was 798 000); a filter that has to examine every user costs 361 000 (was
+819 000), because users are turned into JSON objects directly rather than by a
+marshal and decode, a page without a filter builds objects for the page only,
+and `Memory` narrows an equality by index and computes group memberships in
+one pass. `go test -bench List`.
 
 **Not supported**: bulk operations, sorting, password changes, `/Me`
 (announced as such in `/ServiceProviderConfig`).
