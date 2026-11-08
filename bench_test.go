@@ -62,3 +62,29 @@ func BenchmarkListFilterCo10k(b *testing.B) {
 }
 
 func BenchmarkListAll10k(b *testing.B) { benchList(b, "/Users?count=100") }
+
+// BenchmarkMemoryLoad10k: create 10,000 users, then replace each one (a
+// rename every other time), in a fresh Memory backend. The uniqueness check
+// is what grows with the number of users.
+func BenchmarkMemoryLoad10k(b *testing.B) {
+	ctx := context.Background()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		mem := NewMemory()
+		for j := 0; j < 10_000; j++ {
+			u := User{ID: fmt.Sprintf("u-%05d", j), UserName: fmt.Sprintf("user%05d@example.org", j)}
+			if err := mem.CreateUser(ctx, u); err != nil {
+				b.Fatal(err)
+			}
+		}
+		for j := 0; j < 10_000; j++ {
+			u := User{ID: fmt.Sprintf("u-%05d", j), UserName: fmt.Sprintf("user%05d@example.org", j)}
+			if j%2 == 1 {
+				u.UserName = fmt.Sprintf("renamed%05d@example.org", j)
+			}
+			if err := mem.ReplaceUser(ctx, u, ""); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
