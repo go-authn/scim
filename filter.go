@@ -32,6 +32,7 @@ const maxFilterDepth = 32
 type Filter struct {
 	root node
 	src  string
+	sel  attrSel // the top-level attributes a match reads
 }
 
 // String returns the filter as it was written.
@@ -374,7 +375,36 @@ func ParseFilter(src string) (*Filter, error) {
 	if p.pos != len(p.toks) {
 		return nil, badRequest("invalidFilter", "unexpected %q", p.toks[p.pos].text)
 	}
-	return &Filter{root: n, src: src}, nil
+	sel := attrSel{}
+	collectAttrs(n, sel)
+	return &Filter{root: n, src: src, sel: sel}, nil
+}
+
+// collectAttrs adds to sel the top-level attributes (lower-cased) that a
+// match of n reads from a resource: the attribute of each path, or the schema
+// URN of an extension path. The filter inside a value filter works on the
+// elements of that attribute, not on the resource.
+func collectAttrs(n node, sel attrSel) {
+	path := func(p attrPath) {
+		if p.urn != "" {
+			sel[strings.ToLower(p.urn)] = true
+			return
+		}
+		sel[p.attr] = true
+	}
+	switch x := n.(type) {
+	case *logical:
+		collectAttrs(x.l, sel)
+		collectAttrs(x.r, sel)
+	case *negation:
+		collectAttrs(x.x, sel)
+	case *present:
+		path(x.path)
+	case *compare:
+		path(x.path)
+	case *valueFilter:
+		path(x.path)
+	}
 }
 
 func (p *parser) peek() *token {

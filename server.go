@@ -779,13 +779,15 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, rt resourceType, q
 			matched = append(matched, hit{res: res})
 			continue
 		}
-		m, err := toMap(res)
+		// The filter reads only the attributes it names: match on a map
+		// holding those, and build the whole object for the page alone.
+		m, err := toMapSel(res, f.sel)
 		if err != nil {
 			s.fail(w, err)
 			return
 		}
 		if f.Match(m) {
-			matched = append(matched, hit{res, m})
+			matched = append(matched, hit{res: res})
 		}
 	}
 	out := listResponse{Schemas: []string{ListResponse}, TotalResults: len(matched), StartIndex: start, Resources: []map[string]any{}}
