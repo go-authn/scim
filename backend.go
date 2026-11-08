@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // Backend stores Users and Groups. The Server assigns ids, timestamps and
@@ -49,30 +50,69 @@ type Memory struct {
 	mu     sync.RWMutex
 	users  map[string]User
 	groups map[string]Group
+	// names maps foldKey(userName) to the id of the user that holds it. It
+	// holds exactly the users in m.users (one entry each, userName being
+	// unique). CreateUser, ReplaceUser and removeUser are the only writers
+	// of m.users and keep the two together (TestMemoryIndexAgainstScan).
+	names map[string]string
 }
 
 // NewMemory returns an empty Memory backend.
 func NewMemory() *Memory {
-	return &Memory{users: map[string]User{}, groups: map[string]Group{}}
+	return &Memory{users: map[string]User{}, groups: map[string]Group{}, names: map[string]string{}}
 }
 
-func (m *Memory) userNameTaken(name, except string) bool {
-	for id, u := range m.users {
-		if id != except && strings.EqualFold(u.UserName, name) {
-			return true
+// foldKey maps a userName to a string that is equal for two names exactly
+// when strings.EqualFold says they are equal: each rune becomes the smallest
+// rune of its unicode.SimpleFold orbit (EqualFold's own equivalence; invalid
+// bytes all decode to U+FFFD there and here). ASCII names, the common case,
+// are upper-cased: for ASCII letters the orbit minimum is the capital.
+func foldKey(s string) string {
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			ascii = false
+			break
 		}
 	}
-	return false
+	if ascii {
+		return strings.ToUpper(s)
+	}
+	var b strings.Builder
+	for _, r := range s {
+		low := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			low = min(low, f)
+		}
+		b.WriteRune(low)
+	}
+	return b.String()
+}
+
+// userNameTaken reports whether another user than except has the name.
+func (m *Memory) userNameTaken(name, except string) bool {
+	id, ok := m.names[foldKey(name)]
+	return ok && id != except
+}
+
+func (m *Memory) removeUser(u User) {
+	delete(m.names, foldKey(u.UserName))
+	delete(m.users, u.ID)
 }
 
 func (m *Memory) CreateUser(_ context.Context, u User) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.userNameTaken(u.UserName, "") {
+	key := foldKey(u.UserName)
+	if _, taken := m.names[key]; taken {
 		return ErrConflict
 	}
 	u.Groups = nil
+	if old, ok := m.users[u.ID]; ok { // same id, other name: the old name is released
+		delete(m.names, foldKey(old.UserName))
+	}
 	m.users[u.ID] = u
+	m.names[key] = u.ID
 	return nil
 }
 
@@ -110,8 +150,15 @@ func (m *Memory) ReplaceUser(_ context.Context, u User, ifVersion string) error 
 	if cur.Meta.Version != ifVersion {
 		return ErrPrecondition
 	}
-	if m.userNameTaken(u.UserName, u.ID) {
-		return ErrConflict
+	// A name that is still the user's own cannot conflict and leaves the
+	// index as it is; only a rename touches it.
+	if !strings.EqualFold(cur.UserName, u.UserName) {
+		key := foldKey(u.UserName)
+		if _, taken := m.names[key]; taken {
+			return ErrConflict
+		}
+		delete(m.names, foldKey(cur.UserName))
+		m.names[key] = u.ID
 	}
 	u.Groups = nil
 	m.users[u.ID] = u
@@ -133,7 +180,7 @@ func (m *Memory) DeleteUserIf(_ context.Context, id, ifVersion string) error {
 	if ifVersion != "" && u.Meta.Version != ifVersion {
 		return ErrPrecondition
 	}
-	delete(m.users, id)
+	m.removeUser(u)
 	m.dropMember(id)
 	return nil
 }
