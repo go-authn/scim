@@ -453,7 +453,9 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, rt resourceType, id
 		s.fail(w, err)
 		return
 	}
-	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == res.meta().Version {
+	// RFC 7232 §3.2 and §4.1: the 304 carries the ETag a 200 would have had.
+	if ifNoneMatchFails(r.Header.Values("If-None-Match"), res.meta().Version) {
+		w.Header().Set("ETag", res.meta().Version)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
@@ -777,13 +779,15 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, rt resourceType, q
 			matched = append(matched, hit{res: res})
 			continue
 		}
-		m, err := toMap(res)
+		// The filter reads only the attributes it names: match on a map
+		// holding those, and build the whole object for the page alone.
+		m, err := toMapSel(res, f.sel)
 		if err != nil {
 			s.fail(w, err)
 			return
 		}
 		if f.Match(m) {
-			matched = append(matched, hit{res, m})
+			matched = append(matched, hit{res: res})
 		}
 	}
 	out := listResponse{Schemas: []string{ListResponse}, TotalResults: len(matched), StartIndex: start, Resources: []map[string]any{}}

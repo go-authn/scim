@@ -12,12 +12,25 @@ import (
 // json.Marshal and json.Decode costs eighty allocations per user, paid for
 // every user a list request has to examine. TestToMapMatchesJSON keeps the
 // two paths identical.
-func toMap(v any) (map[string]any, error) {
+func toMap(v any) (map[string]any, error) { return toMapSel(v, nil) }
+
+// attrSel names the top-level attributes a map is built with, lower-cased;
+// nil means all of them.
+type attrSel map[string]bool
+
+func (s attrSel) has(lower string) bool { return s == nil || s[lower] }
+
+// toMapSel is toMap restricted to the top-level attributes in sel. A filter
+// reads only the attributes it names (Filter.attrs), so matching it against
+// the restricted map gives the answer it gives on the whole one, without
+// building what it never looks at (TestFilterOnSelectedMap). The restricted
+// map is for matching only: a response is built from toMap.
+func toMapSel(v any, sel attrSel) (map[string]any, error) {
 	switch r := v.(type) {
 	case *User:
-		return userMap(r), nil
+		return userMap(r, sel), nil
 	case *Group:
-		return groupMap(r), nil
+		return groupMap(r, sel), nil
 	}
 	return jsonMap(v)
 }
@@ -76,13 +89,28 @@ func refList(refs []Ref) []any {
 	return out
 }
 
-func userMap(u *User) map[string]any {
-	m := make(map[string]any, 11)
-	m["schemas"] = strList(u.Schemas)
-	m["id"] = u.ID
-	putStr(m, "externalId", u.ExternalID)
-	m["userName"] = u.UserName
-	if u.Name != nil {
+func mapFor(sel attrSel, full int) map[string]any {
+	if sel == nil {
+		return make(map[string]any, full)
+	}
+	return make(map[string]any, min(len(sel), full))
+}
+
+func userMap(u *User, sel attrSel) map[string]any {
+	m := mapFor(sel, 11)
+	if sel.has("schemas") {
+		m["schemas"] = strList(u.Schemas)
+	}
+	if sel.has("id") {
+		m["id"] = u.ID
+	}
+	if sel.has("externalid") {
+		putStr(m, "externalId", u.ExternalID)
+	}
+	if sel.has("username") {
+		m["userName"] = u.UserName
+	}
+	if u.Name != nil && sel.has("name") {
 		n := make(map[string]any, 6)
 		putStr(n, "formatted", u.Name.Formatted)
 		putStr(n, "familyName", u.Name.FamilyName)
@@ -92,11 +120,13 @@ func userMap(u *User) map[string]any {
 		putStr(n, "honorificSuffix", u.Name.HonorificSuffix)
 		m["name"] = n
 	}
-	putStr(m, "displayName", u.DisplayName)
-	if u.Active != nil {
+	if sel.has("displayname") {
+		putStr(m, "displayName", u.DisplayName)
+	}
+	if u.Active != nil && sel.has("active") {
 		m["active"] = bool(*u.Active)
 	}
-	if len(u.Emails) > 0 {
+	if len(u.Emails) > 0 && sel.has("emails") {
 		es := make([]any, len(u.Emails))
 		for i, e := range u.Emails {
 			em := make(map[string]any, 4)
@@ -110,22 +140,34 @@ func userMap(u *User) map[string]any {
 		}
 		m["emails"] = es
 	}
-	if len(u.Groups) > 0 {
+	if len(u.Groups) > 0 && sel.has("groups") {
 		m["groups"] = refList(u.Groups)
 	}
-	m["meta"] = metaMap(&u.Meta)
+	if sel.has("meta") {
+		m["meta"] = metaMap(&u.Meta)
+	}
 	return m
 }
 
-func groupMap(g *Group) map[string]any {
-	m := make(map[string]any, 6)
-	m["schemas"] = strList(g.Schemas)
-	m["id"] = g.ID
-	putStr(m, "externalId", g.ExternalID)
-	m["displayName"] = g.DisplayName
-	if len(g.Members) > 0 {
+func groupMap(g *Group, sel attrSel) map[string]any {
+	m := mapFor(sel, 6)
+	if sel.has("schemas") {
+		m["schemas"] = strList(g.Schemas)
+	}
+	if sel.has("id") {
+		m["id"] = g.ID
+	}
+	if sel.has("externalid") {
+		putStr(m, "externalId", g.ExternalID)
+	}
+	if sel.has("displayname") {
+		m["displayName"] = g.DisplayName
+	}
+	if len(g.Members) > 0 && sel.has("members") {
 		m["members"] = refList(g.Members)
 	}
-	m["meta"] = metaMap(&g.Meta)
+	if sel.has("meta") {
+		m["meta"] = metaMap(&g.Meta)
+	}
 	return m
 }

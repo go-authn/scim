@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.2.1
+
+### Fixed
+- `GET` with `If-None-Match` now follows RFC 7232 §3.2: a list of entity-tags
+  (several header lines too) answers 304 when any of them matches by weak
+  comparison (`"x"` matches `W/"x"`), `*` answers 304 for any existing resource,
+  and a header that is not valid `If-None-Match` is ignored. The 304 carries the
+  `ETag` (RFC 7232 §4.1); it did not. Fuzz target `FuzzIfNoneMatch`. (#7)
+
+### Performance
+- `Memory` checks `userName` uniqueness through an index instead of scanning
+  every user: loading N users is O(N), not O(N^2) `EqualFold` calls. The index
+  key is the `unicode.SimpleFold` orbit minimum of each rune, which is exactly
+  `strings.EqualFold`'s equivalence (tests against the old scan as oracle;
+  `FuzzFoldKey`). Create, replace (PUT and PATCH) and delete keep it consistent.
+  `BenchmarkMemoryLoad10k` (create + replace 10,000 users): 119,030 allocations
+  per run, 98,959 before (the index costs one key per create and rename); the
+  100 million `EqualFold` calls are gone. (#6)
+- A list with a filter that cannot be answered from an index matches it on a
+  map holding only the top-level attributes the filter names, and builds whole
+  objects for the page. `BenchmarkListFilterCo10k` (10,000 users): 361,095 to
+  162,695 allocations per request (36.1 to 16.3 per user). Equivalence is
+  tested for 50 filters and random ones (`TestFilterOnSelectedMap*`,
+  `FuzzFilterOnSelectedMap`). (#5)
+
 ## v0.2.0
 
 Audit, fuzz, chaos and performance pass.
