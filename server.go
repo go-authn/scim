@@ -453,7 +453,9 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, rt resourceType, id
 		s.fail(w, err)
 		return
 	}
-	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == res.meta().Version {
+	// RFC 7232 §3.2 and §4.1: the 304 carries the ETag a 200 would have had.
+	if ifNoneMatchFails(r.Header.Values("If-None-Match"), res.meta().Version) {
+		w.Header().Set("ETag", res.meta().Version)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
