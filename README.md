@@ -23,7 +23,7 @@ mux.Handle("/scim/v2/", http.StripPrefix("/scim/v2", scim.BearerAuth(token, srv)
 | | |
 |---|---|
 | `/Users`, `/Groups` | `GET` (list: `filter`, `startIndex`, `count`, `attributes`, `excludedAttributes`), `POST` (201 with `Location`) |
-| `/Users/{id}`, `/Groups/{id}` | `GET` (`ETag`, `If-None-Match`), `PUT`, `PATCH`, `DELETE` (`If-Match` on all three) |
+| `/Users/{id}`, `/Groups/{id}` | `GET` (`ETag`; `If-None-Match` as a list of entity-tags or `*`, weak comparison, RFC 7232 §3.2), `PUT`, `PATCH`, `DELETE` (`If-Match` on all three) |
 | `/Users/.search`, `/Groups/.search` | `POST` a SearchRequest, for queries that should not sit in a URL (RFC 7644 §3.4.3, §7.5.2) |
 | `/ServiceProviderConfig`, `/ResourceTypes`, `/Schemas` | discovery (RFC 7644 §4); a `filter` there is answered 403 |
 
@@ -103,10 +103,12 @@ comparisons. The filter, PATCH and the whole handler are fuzzed
 **Performance** (10,000 users, 200 groups, Memory backend, per request):
 a list page costs 15 000 allocations (was 789 000); `userName eq "…"` costs 90
 (was 798 000); a filter that has to examine every user costs 361 000 (was
-819 000), because users are turned into JSON objects directly rather than by a
-marshal and decode, a page without a filter builds objects for the page only,
-and `Memory` narrows an equality by index and computes group memberships in
-one pass. `go test -bench List`.
+819 000; 163 000 since v0.2.1), because users are turned into JSON objects
+directly rather than by a marshal and decode, a filter is matched on the
+attributes it names and whole objects are built for the page only, and
+`Memory` narrows an equality by index and computes group memberships in one
+pass. `Memory` checks `userName` uniqueness (case-insensitive) through an index,
+so loading N users is O(N). `go test -bench 'List|MemoryLoad'`.
 
 **Not supported**: bulk operations, sorting, password changes, `/Me`
 (announced as such in `/ServiceProviderConfig`).
