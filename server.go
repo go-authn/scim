@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Server is the SCIM HTTP handler. Mount it at the SCIM root (strip the
@@ -302,11 +303,33 @@ func validString(v string) bool {
 	return true
 }
 
+// validUserName refuses what makes two userNames look alike while being
+// different: format characters (Cf: zero-width, soft hyphen, bidi overrides)
+// anywhere, and white space at either end. RFC 7643 §4.1.1 requires only a
+// non-empty, unique, case-insensitive name, so this is the server's policy,
+// the one that keeps "unique" meaning what a person reading the name sees.
+// Compatibility variants (fullwidth letters) are one name in the Memory
+// backend's uniqueness key (foldKey, NFKC).
+func validUserName(v string) bool {
+	if r, _ := utf8.DecodeRuneInString(v); unicode.IsSpace(r) {
+		return false
+	}
+	if r, _ := utf8.DecodeLastRuneInString(v); unicode.IsSpace(r) {
+		return false
+	}
+	for _, r := range v {
+		if unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) validUser(u *User) *Error {
 	u.Schemas = []string{UserSchema}
 	u.Groups = nil // read-only (RFC 7643 §4.1.2)
-	if strings.TrimSpace(u.UserName) == "" || len(u.UserName) > 256 || !validString(u.UserName) {
-		return badRequest("invalidValue", "userName is required, at most 256 bytes, without control characters")
+	if strings.TrimSpace(u.UserName) == "" || len(u.UserName) > 256 || !validString(u.UserName) || !validUserName(u.UserName) {
+		return badRequest("invalidValue", "userName is required, at most 256 bytes, without control or format characters, and without leading or trailing white space")
 	}
 	if !validString(u.ExternalID) || !validString(u.DisplayName) || len(u.Emails) > 100 {
 		return badRequest("invalidValue", "a value is too long, has control characters, or there are too many emails")

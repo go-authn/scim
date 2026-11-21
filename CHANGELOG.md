@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0
+
+### Security
+- `userName` look-alikes were distinct users: `"alice "`, `" alice"`, a name
+  with U+200B, U+202E or a soft hyphen, and a fullwidth `ａlice` were all
+  created (201) beside `alice`, because uniqueness was `strings.EqualFold` alone
+  and only control characters (Cc) were refused. RFC 7643 §4.1.1 requires only
+  a non-empty, unique, case-insensitive `userName` and names no normalisation,
+  so this is the server's policy: `userName` now refuses format characters (Cf)
+  anywhere and white space at either end (400 `invalidValue`), and `Memory`
+  compares uniqueness (create, rename, and the `userName eq` narrowing) on NFKC
+  plus case fold, so compatibility variants and composed/decomposed spellings
+  are one name (409).
+- **Upgrade:** a client that sends a `userName` with a leading or trailing
+  space, or with a zero-width joiner/non-joiner or another Cf character (some
+  Persian and Indic names use them), is now answered 400. Users already stored
+  under such names stay readable but cannot be re-saved without cleaning the
+  name. A custom `Backend` should apply the same NFKC + fold to its uniqueness
+  check; the module now depends on `golang.org/x/text` (unicode/norm).
+
 ## v0.2.1
 
 ### Fixed
