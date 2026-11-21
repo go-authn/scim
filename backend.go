@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Backend stores Users and Groups. The Server assigns ids, timestamps and
@@ -67,6 +69,13 @@ func NewMemory() *Memory {
 // rune of its unicode.SimpleFold orbit (EqualFold's own equivalence; invalid
 // bytes all decode to U+FFFD there and here). ASCII names, the common case,
 // are upper-cased: for ASCII letters the orbit minimum is the capital.
+//
+// The name is first put in NFKC (UAX #15), so that spellings a person reads as
+// one name -- a fullwidth "ａlice" and "alice", "ﬁ" and "fi" -- share one key.
+// RFC 7643 §4.1.1 only says userName MUST be unique and "is case insensitive";
+// it names no normalisation, so this is the service provider's policy, and
+// the server refuses the characters that NFKC cannot make comparable
+// (format characters, leading and trailing white space: validUser).
 func foldKey(s string) string {
 	ascii := true
 	for i := 0; i < len(s); i++ {
@@ -79,7 +88,7 @@ func foldKey(s string) string {
 		return strings.ToUpper(s)
 	}
 	var b strings.Builder
-	for _, r := range s {
+	for _, r := range norm.NFKC.String(s) {
 		low := r
 		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
 			low = min(low, f)
@@ -152,12 +161,11 @@ func (m *Memory) ReplaceUser(_ context.Context, u User, ifVersion string) error 
 	}
 	// A name that is still the user's own cannot conflict and leaves the
 	// index as it is; only a rename touches it.
-	if !strings.EqualFold(cur.UserName, u.UserName) {
-		key := foldKey(u.UserName)
+	if curKey, key := foldKey(cur.UserName), foldKey(u.UserName); curKey != key {
 		if _, taken := m.names[key]; taken {
 			return ErrConflict
 		}
-		delete(m.names, foldKey(cur.UserName))
+		delete(m.names, curKey)
 		m.names[key] = u.ID
 	}
 	u.Groups = nil
@@ -205,8 +213,12 @@ func (m *Memory) ListUsers(_ context.Context, f *Filter) ([]User, error) {
 	defer m.mu.RUnlock()
 	if attr, want, ok := hint(f, "username", "externalid", "id"); ok {
 		var out []User
+		wantKey := ""
+		if attr == "username" {
+			wantKey = foldKey(want) // a superset of EqualFold: the Server filters exactly after
+		}
 		for _, u := range m.users {
-			if attr == "username" && strings.EqualFold(u.UserName, want) ||
+			if attr == "username" && foldKey(u.UserName) == wantKey ||
 				attr == "externalid" && u.ExternalID == want || attr == "id" && u.ID == want {
 				out = append(out, m.withGroups(u))
 			}
