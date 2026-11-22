@@ -483,6 +483,10 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, rt resourceType, id
 		return
 	}
 	q := r.URL.Query()
+	if e := checkProjection(q.Get("attributes"), q.Get("excludedAttributes")); e != nil {
+		writeError(w, e)
+		return
+	}
 	m, err := toMap(res)
 	if err != nil {
 		s.fail(w, err)
@@ -736,6 +740,21 @@ func pageParam(q map[string][]string, name string, def int) (int, *Error) {
 	return int(max(min(n, math.MaxInt32), math.MinInt32)), nil
 }
 
+// maxProjectionPaths bounds the attributes (or excludedAttributes) a request
+// may name. Every item of a page is projected through the list, so its length
+// multiplies the work of one request by the page size.
+const maxProjectionPaths = 64
+
+// checkProjection refuses an attribute list longer than maxProjectionPaths.
+func checkProjection(attributes, excluded string) *Error {
+	for _, l := range []string{attributes, excluded} {
+		if l != "" && strings.Count(l, ",") >= maxProjectionPaths {
+			return badRequest("invalidValue", "at most %d attributes may be named", maxProjectionPaths)
+		}
+	}
+	return nil
+}
+
 func first(q map[string][]string, name string) string {
 	if vs := q[name]; len(vs) > 0 {
 		return vs[0]
@@ -744,6 +763,10 @@ func first(q map[string][]string, name string) string {
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request, rt resourceType, q map[string][]string) {
+	if e := checkProjection(first(q, "attributes"), first(q, "excludedAttributes")); e != nil {
+		writeError(w, e)
+		return
+	}
 	var f *Filter
 	if src := first(q, "filter"); src != "" {
 		var err error

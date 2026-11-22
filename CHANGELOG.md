@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.0
+
+### Security
+- `attributes` and `excludedAttributes` are bounded: more than 64 paths is
+  refused (400 `invalidValue`), on a list, on `POST /.search` and on a single
+  resource. Every item of a page was projected through the whole list, so a
+  1 MiB body naming an attribute tens of thousands of times cost a page's worth
+  of parsing per request. A client that sent more than 64 paths gets a 400 now.
+
 ## v0.3.0
 
 ### Security
